@@ -107,11 +107,12 @@ func runInitManaged(
 	// deployment to provision and reference; otherwise we use the curated/custom
 	// model prompt (or --model in --no-prompt mode).
 	var (
-		model      string
-		deployment *project.Deployment
+		model           string
+		deployment      *project.Deployment
+		isNewDeployment bool
 	)
 	if useGuidedFoundry {
-		deployment, err = resolvePromptHarnessTarget(ctx, azdClient, flags, env, &settings)
+		deployment, isNewDeployment, err = resolvePromptHarnessTarget(ctx, azdClient, flags, env, &settings)
 		if err != nil {
 			return err
 		}
@@ -163,12 +164,16 @@ func runInitManaged(
 		return err
 	}
 
-	if err := addPromptAgentService(ctx, azdClient, agentName, serviceRelPath, &settings, deployment); err != nil {
+	if err := addPromptAgentService(
+		ctx, azdClient, agentName, serviceRelPath, &settings, deployment, isNewDeployment,
+	); err != nil {
 		return err
 	}
 
 	// Persist the deployment name (matching hosted) so other commands can
-	// resolve the model deployment from the azd environment.
+	// resolve the model deployment from the azd environment. This happens for
+	// both new and reused deployments — a reused deployment still needs to be
+	// referenced by name even though it is not declared for provisioning.
 	if deployment != nil {
 		if err := setEnvValue(ctx, azdClient, env.Name, "AZURE_AI_MODEL_DEPLOYMENT_NAME", deployment.Name); err != nil {
 			return err
@@ -182,19 +187,26 @@ func runInitManaged(
 // addPromptAgentService registers the prompt agent as an azure.yaml service
 // entry with Host=azure.ai.agent and a promptAgent config block. Unlike hosted
 // agents there is no Docker/Language — the harness owns the runtime. When a
-// resolved model deployment is supplied it is recorded under the service config
-// so `azd provision` creates it (via AI_PROJECT_DEPLOYMENTS), mirroring hosted.
+// newly-configured model deployment is supplied (isNewDeployment) it is
+// recorded under the service config so `azd provision` creates it (via
+// AI_PROJECT_DEPLOYMENTS), mirroring hosted. A reused existing deployment is
+// referenced by name only and is never declared here.
 func addPromptAgentService(
 	ctx context.Context,
 	azdClient *azdext.AzdClient,
 	agentName, serviceRelPath string,
 	settings *project.PromptAgentSettings,
 	deployment *project.Deployment,
+	isNewDeployment bool,
 ) error {
 	agentConfig := project.ServiceTargetAgentConfig{
 		PromptAgent: settings,
 	}
-	if deployment != nil {
+	// Only a newly-configured deployment is declared for provisioning. An
+	// existing deployment the user chose to reuse is referenced via
+	// AZURE_AI_MODEL_DEPLOYMENT_NAME only; declaring it here would make
+	// `azd provision` redundantly try to (re)create it.
+	if deployment != nil && isNewDeployment {
 		agentConfig.Deployments = []project.Deployment{*deployment}
 	}
 	configStruct, err := project.MarshalStruct(&agentConfig)
