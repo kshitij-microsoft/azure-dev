@@ -33,10 +33,10 @@ func resolvePromptHarnessTarget(
 	flags *initFlags,
 	env *azdext.Environment,
 	settings *project.PromptAgentSettings,
-) (*project.Deployment, error) {
+) (*project.Deployment, bool, error) {
 	azureContext, err := loadAzureContext(ctx, azdClient, env.Name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Subscription only — location is resolved per project branch below.
@@ -45,14 +45,14 @@ func resolvePromptHarnessTarget(
 		"Select an Azure subscription to find your Foundry project and models.",
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	proj, err := selectPromptFoundryProject(
 		ctx, azdClient, cred, azureContext, env.Name, flags.projectResourceId,
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if proj == nil {
@@ -63,17 +63,22 @@ func resolvePromptHarnessTarget(
 				"with the model deployment you choose next.",
 		))
 		if err := ensureLocation(ctx, azdClient, azureContext, env.Name); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := setEnvValue(ctx, azdClient, env.Name, "USE_EXISTING_AI_PROJECT", "false"); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := updatePendingProjectSignal(ctx, azdClient, env.Name, false); err != nil {
 			log.Printf("warning: failed to update project provision signal: %v", err)
 		}
 		// A new project is provisioned by `azd up`; the harness workspace tuple
-		// is filled from the provisioned env values at deploy time (overlay).
-		return resolvePromptModelDeployment(ctx, azdClient, azureContext, env, flags)
+		// is filled from the provisioned env values at deploy time (overlay). A
+		// brand-new project always deploys a new model, so isNew is always true.
+		deployment, err := resolvePromptModelDeployment(ctx, azdClient, azureContext, env, flags)
+		if err != nil {
+			return nil, false, err
+		}
+		return deployment, true, nil
 	}
 
 	// Existing project: populate the harness target and derive the location
@@ -92,7 +97,7 @@ func resolvePromptHarnessTarget(
 	azureContext.Scope.Location = proj.Location
 	if proj.Location != "" {
 		if err := setEnvValue(ctx, azdClient, env.Name, "AZURE_AI_DEPLOYMENTS_LOCATION", proj.Location); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		// Also seed AZURE_LOCATION from the selected project's region. The
 		// infra main.parameters.json resolves `location` from ${AZURE_LOCATION};
@@ -100,15 +105,15 @@ func resolvePromptHarnessTarget(
 		// (and thus the target region) is already known. Deploy the model using
 		// the project's region.
 		if err := setEnvValue(ctx, azdClient, env.Name, "AZURE_LOCATION", proj.Location); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
 	if err := setPromptFoundryProjectEnv(ctx, azdClient, env.Name, proj); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := setEnvValue(ctx, azdClient, env.Name, "USE_EXISTING_AI_PROJECT", "true"); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := updatePendingProjectSignal(ctx, azdClient, env.Name, true); err != nil {
 		log.Printf("warning: failed to update project provision signal: %v", err)
@@ -227,6 +232,10 @@ func setPromptFoundryProjectEnv(
 // agent on an already-selected Foundry project. It offers the project's
 // existing deployments first (reuse a live deployment), plus a "deploy a new
 // model" option that runs the full catalog -> version -> SKU -> capacity flow.
+//
+// The returned bool is isNew: true when the user configured a brand-new model
+// deployment that `azd provision` must create, false when the user chose to
+// reuse an existing deployment (which is referenced, never re-provisioned).
 func resolvePromptModelForExistingProject(
 	ctx context.Context,
 	azdClient *azdext.AzdClient,
@@ -235,7 +244,7 @@ func resolvePromptModelForExistingProject(
 	env *azdext.Environment,
 	flags *initFlags,
 	proj *FoundryProjectInfo,
-) (*project.Deployment, error) {
+) (*project.Deployment, bool, error) {
 	// --model short-circuits to the new-deployment configuration so the named
 	// model is resolved (version/SKU/capacity) and provisioned.
 	if strings.TrimSpace(flags.model) == "" {
@@ -278,10 +287,13 @@ func resolvePromptModelForExistingProject(
 			})
 			if selErr != nil {
 				if exterrors.IsCancellation(selErr) {
-					return nil, exterrors.Cancelled("model selection was cancelled")
+					return nil, false, exterrors.Cancelled("model selection was cancelled")
 				}
-				return nil, fmt.Errorf("prompting for model deployment: %w", selErr)
+				return nil, false, fmt.Errorf("prompting for model deployment: %w", selErr)
 			}
+			// An existing deployment is referenced, not provisioned: return
+			// isNew=false so the caller does not declare it under the service's
+			// deployments (which `azd provision` would try to (re)create).
 			if selected := choices[*resp.Value].Value; selected != newModelValue {
 				d := byName[selected]
 				return &project.Deployment{
@@ -295,12 +307,18 @@ func resolvePromptModelForExistingProject(
 						Name:     d.SkuName,
 						Capacity: d.SkuCapacity,
 					},
-				}, nil
+				}, false, nil
 			}
 		}
 	}
 
-	return resolvePromptModelDeployment(ctx, azdClient, azureContext, env, flags)
+	// Fell through to the full catalog flow: a new model deployment will be
+	// configured and must be provisioned, so isNew=true.
+	deployment, err := resolvePromptModelDeployment(ctx, azdClient, azureContext, env, flags)
+	if err != nil {
+		return nil, false, err
+	}
+	return deployment, true, nil
 }
 
 // resolvePromptModelDeployment runs the full "deploy a new model" flow — model
